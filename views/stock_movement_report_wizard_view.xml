@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Wizard Form View -->
+    <record id="view_stock_movement_report_wizard_form" model="ir.ui.view">
+        <field name="name">stock.movement.report.wizard.form</field>
+        <field name="model">stock.movement.report.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Stock Movement Excel Report">
+                <group>
+                    <group string="Date Range">
+                        <field name="date_from"/>
+                        <field name="date_to"/>
+                    </group>
+                    <group string="Include Data From">
+                        <field name="include_purchases"/>
+                        <field name="include_sales"/>
+                        <field name="include_pos"/>
+                    </group>
+                </group>
+                <group>
+                    <group string="Filter by Products">
+                        <field name="product_ids" widget="many2many_tags"
+                               options="{'no_create': True}"
+                               domain="[('type', '=', 'product')]"/>
+                        <field name="category_ids" widget="many2many_tags"
+                               options="{'no_create': True}"/>
+                    </group>
+                    <group string="Filter by Location">
+                        <field name="warehouse_ids" widget="many2many_tags"
+                               options="{'no_create': True}"/>
+                    </group>
+                </group>
+                <group invisible="not excel_file">
+                    <field name="excel_file" filename="file_name"/>
+                    <field name="file_name" invisible="1"/>
+                </group>
+                <footer>
+                    <button name="action_generate_report"
+                            string="Generate Excel Report"
+                            type="object"
+                            class="btn-primary"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <!-- Wizard Action -->
+    <record id="action_stock_movement_report_wizard" model="ir.actions.act_window">
+        <field name="name">Stock Movement Excel Report</field>
+        <field name="res_model">stock.movement.report.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+        <field name="view_id" ref="view_stock_movement_report_wizard_form"/>
+    </record>
+
+    <!-- Menu Items -->
+    <menuitem id="menu_stock_movement_report_inventory"
+              name="Stock Movement Excel Report"
+              parent="stock.menu_warehouse_report"
+              action="action_stock_movement_report_wizard"
+              sequence="550"/>
+</odoo>
