@@ -383,7 +383,7 @@ class StockMovementReportWizard(models.TransientModel):
             'font_size': 10,
             'align': 'right',
             'valign': 'vcenter',
-            'num_format': '$#,##0.00',
+            'num_format': 'Rp #,##0.00',
             'border': 1,
         })
 

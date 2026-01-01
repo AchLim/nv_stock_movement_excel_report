@@ -21,7 +21,7 @@
                     <group string="Filter by Products">
                         <field name="product_ids" widget="many2many_tags"
                                options="{'no_create': True}"
-                               domain="[('type', '=', 'product')]"/>
+                               domain="[('type', '=', 'consu')]"/>
                         <field name="category_ids" widget="many2many_tags"
                                options="{'no_create': True}"/>
                     </group>
