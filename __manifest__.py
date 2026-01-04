@@ -23,6 +23,7 @@
         'purchase',
         'sale',
         'point_of_sale',
+        'mrp',
     ],
     'data': [
         'security/ir.model.access.csv',

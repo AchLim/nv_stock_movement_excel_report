@@ -83,7 +83,7 @@ class StockMovementReportWizard(models.TransientModel):
         return months
 
     def _get_products(self):
-        """Get product variants to include in report"""
+        """Get product variants to include in report, excluding phantom BoM (kit) products"""
         domain = [('type', '=', 'consu')]
 
         if self.product_ids:
@@ -92,7 +92,22 @@ class StockMovementReportWizard(models.TransientModel):
         if self.category_ids:
             domain.append(('categ_id', 'child_of', self.category_ids.ids))
 
-        return self.env['product.product'].search(domain, order='name')
+        products = self.env['product.product'].search(domain, order='name')
+
+        # Exclude products that have phantom BoM (kits) to avoid double counting
+        # Kit products' stock movements are already reflected in their components
+        if products:
+            phantom_bom_product_tmpl_ids = self.env['mrp.bom'].search([
+                ('type', '=', 'phantom'),
+                ('product_tmpl_id', 'in', products.product_tmpl_id.ids)
+            ]).mapped('product_tmpl_id').ids
+
+            if phantom_bom_product_tmpl_ids:
+                products = products.filtered(
+                    lambda p: p.product_tmpl_id.id not in phantom_bom_product_tmpl_ids
+                )
+
+        return products
 
     def _get_product_display_name(self, product):
         """Get product name with all variant attributes in one cell"""
@@ -148,7 +163,7 @@ class StockMovementReportWizard(models.TransientModel):
         return result[0] if result else 0
 
     def _get_stock_moves_data(self, product_id, date_start, date_end, location_ids):
-        """Get stock move data for a product in a date range"""
+        """Get stock move data for a product in a date range with proper UoM conversion"""
         data = {
             'qty_in': 0,
             'qty_out': 0,
@@ -204,14 +219,18 @@ class StockMovementReportWizard(models.TransientModel):
             data['qty_out'] = result[0] or 0
             data['value_out'] = result[1] or 0
 
-        # Get purchase-specific data
+        # Get purchase-specific data with UoM conversion
         if self.include_purchases:
             self.env.cr.execute("""
-                                SELECT COALESCE(SUM(pol.qty_received), 0) as qty,
+                                SELECT COALESCE(SUM(pol.qty_received / pol_uom.factor * prod_uom.factor), 0) as qty,
                                        COALESCE(SUM(pol.qty_received * pol.price_unit), 0) as value
                                 FROM purchase_order_line pol
                                     JOIN purchase_order po
                                 ON pol.order_id = po.id
+                                    JOIN product_product pp ON pol.product_id = pp.id
+                                    JOIN product_template pt ON pp.product_tmpl_id = pt.id
+                                    JOIN uom_uom prod_uom ON pt.uom_id = prod_uom.id
+                                    JOIN uom_uom pol_uom ON pol.product_uom_id = pol_uom.id
                                 WHERE pol.product_id = %s
                                   AND po.state IN ('purchase'
                                     , 'done')
@@ -224,14 +243,18 @@ class StockMovementReportWizard(models.TransientModel):
                 data['purchase_qty'] = result[0] or 0
                 data['purchase_value'] = result[1] or 0
 
-        # Get sales order data
+        # Get sales order data with UoM conversion
         if self.include_sales:
             self.env.cr.execute("""
-                                SELECT COALESCE(SUM(sol.qty_delivered), 0) as qty,
+                                SELECT COALESCE(SUM(sol.qty_delivered / sol_uom.factor * prod_uom.factor), 0) as qty,
                                        COALESCE(SUM(sol.qty_delivered * sol.price_unit), 0) as value
                                 FROM sale_order_line sol
                                     JOIN sale_order so
                                 ON sol.order_id = so.id
+                                    JOIN product_product pp ON sol.product_id = pp.id
+                                    JOIN product_template pt ON pp.product_tmpl_id = pt.id
+                                    JOIN uom_uom prod_uom ON pt.uom_id = prod_uom.id
+                                    JOIN uom_uom sol_uom ON sol.product_uom_id = sol_uom.id
                                 WHERE sol.product_id = %s
                                   AND so.state IN ('sale'
                                     , 'done')
@@ -244,20 +267,17 @@ class StockMovementReportWizard(models.TransientModel):
                 data['sale_qty'] = result[0] or 0
                 data['sale_value'] = result[1] or 0
 
-        # Get POS sales data
+        # Get POS sales data with UoM conversion
         if self.include_pos:
             self.env.cr.execute("""
                                 SELECT COALESCE(SUM(pol.qty), 0) as qty,
                                        COALESCE(SUM(pol.price_subtotal_incl), 0) as value
                                 FROM pos_order_line pol
-                                    JOIN pos_order po
-                                ON pol.order_id = po.id
+                                JOIN pos_order po ON pol.order_id = po.id
                                 WHERE pol.product_id = %s
-                                  AND po.state IN ('paid'
-                                    , 'done'
-                                    , 'invoiced')
-                                  AND po.date_order:: date >= %s
-                                  AND po.date_order:: date <= %s
+                                  AND po.state IN ('paid', 'done', 'invoiced')
+                                  AND po.date_order::date >= %s
+                                  AND po.date_order::date <= %s
                                 """, (product_id, date_start, date_end))
 
             result = self.env.cr.fetchone()
