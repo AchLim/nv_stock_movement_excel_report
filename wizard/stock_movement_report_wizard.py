@@ -246,6 +246,29 @@ class StockMovementReportWizard(models.TransientModel):
                 data['purchase_qty'] = result[0] or 0
                 data['purchase_value'] = result[1] or 0
 
+        # Add purchases from phantom BoM (kit) products
+        for kit_product_id, bom_qty in phantom_bom_data.items():
+            self.env.cr.execute("""
+                                SELECT COALESCE(SUM(pol.qty_received / pol_uom.factor * prod_uom.factor), 0) as qty,
+                                       COALESCE(SUM(pol.qty_received * pol.price_unit), 0) as value
+                                FROM purchase_order_line pol
+                                JOIN purchase_order po ON pol.order_id = po.id
+                                JOIN product_product pp ON pol.product_id = pp.id
+                                JOIN product_template pt ON pp.product_tmpl_id = pt.id
+                                JOIN uom_uom prod_uom ON pt.uom_id = prod_uom.id
+                                JOIN uom_uom pol_uom ON pol.product_uom_id = pol_uom.id
+                                WHERE pol.product_id = %s
+                                  AND po.state IN ('purchase', 'done')
+                                  AND po.date_approve::date >= %s
+                                  AND po.date_approve::date <= %s
+                                """, (kit_product_id, date_start, date_end))
+
+            result = self.env.cr.fetchone()
+            if result and result[0]:
+                # Multiply by BoM quantity to get component quantity
+                data['purchase_qty'] += (result[0] or 0) * bom_qty
+                data['purchase_value'] += (result[1] or 0) * bom_qty
+
         # Get sales order data with UoM conversion
         if self.include_sales:
             # Direct sales of the product
