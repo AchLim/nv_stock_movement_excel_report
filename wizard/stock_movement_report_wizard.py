@@ -139,12 +139,12 @@ class StockMovementReportWizard(models.TransientModel):
         return locations.ids
 
     def _get_stock_at_date(self, product_id, date, location_ids):
-        """Calculate stock quantity at a specific date"""
+        """Calculate stock quantity at a specific date using product_qty (already in product's base UoM)"""
         self.env.cr.execute("""
                             SELECT COALESCE(SUM(
                                                     CASE
-                                                        WHEN sm.location_dest_id IN %s THEN sm.quantity
-                                                        WHEN sm.location_id IN %s THEN -sm.quantity
+                                                        WHEN sm.location_dest_id IN %s THEN sm.product_qty
+                                                        WHEN sm.location_id IN %s THEN -sm.product_qty
                                                         ELSE 0
                                                         END
                                             ), 0) as qty
@@ -163,7 +163,7 @@ class StockMovementReportWizard(models.TransientModel):
         return result[0] if result else 0
 
     def _get_stock_moves_data(self, product_id, date_start, date_end, location_ids):
-        """Get stock move data for a product in a date range with proper UoM conversion"""
+        """Get stock move data for a product in a date range"""
         data = {
             'qty_in': 0,
             'qty_out': 0,
@@ -177,16 +177,19 @@ class StockMovementReportWizard(models.TransientModel):
             'pos_value': 0,
         }
 
-        # Get incoming moves (purchases and other incoming)
+        # Find phantom BoMs that contain this product as a component
+        phantom_bom_data = self._get_phantom_bom_components(product_id)
+
+        # Get incoming moves using product_qty (already in product's base UoM)
         self.env.cr.execute("""
-                            SELECT COALESCE(SUM(sm.quantity), 0) as qty,
-                                   COALESCE(SUM(sm.quantity * COALESCE(
+                            SELECT COALESCE(SUM(sm.product_qty), 0) as qty,
+                                   COALESCE(SUM(sm.product_qty * COALESCE(
                                            (SELECT pol.price_unit
                                             FROM purchase_order_line pol
                                                      JOIN stock_move sm2 ON sm2.purchase_line_id = pol.id
                                             WHERE sm2.id = sm.id LIMIT 1),
-                    sm.price_unit
-                )), 0) as value
+                                           sm.price_unit
+                                   )), 0) as value
                             FROM stock_move sm
                             WHERE sm.product_id = %s
                               AND sm.state = 'done'
@@ -201,10 +204,10 @@ class StockMovementReportWizard(models.TransientModel):
             data['qty_in'] = result[0] or 0
             data['value_in'] = result[1] or 0
 
-        # Get outgoing moves (sales and other outgoing)
+        # Get outgoing moves using product_qty (already in product's base UoM)
         self.env.cr.execute("""
-                            SELECT COALESCE(SUM(sm.quantity), 0) as qty,
-                                   COALESCE(SUM(sm.quantity * sm.price_unit), 0) as value
+                            SELECT COALESCE(SUM(sm.product_qty), 0) as qty,
+                                   COALESCE(SUM(sm.product_qty * sm.price_unit), 0) as value
                             FROM stock_move sm
                             WHERE sm.product_id = %s
                               AND sm.state = 'done'
@@ -245,6 +248,7 @@ class StockMovementReportWizard(models.TransientModel):
 
         # Get sales order data with UoM conversion
         if self.include_sales:
+            # Direct sales of the product
             self.env.cr.execute("""
                                 SELECT COALESCE(SUM(sol.qty_delivered / sol_uom.factor * prod_uom.factor), 0) as qty,
                                        COALESCE(SUM(sol.qty_delivered * sol.price_unit), 0) as value
@@ -267,17 +271,46 @@ class StockMovementReportWizard(models.TransientModel):
                 data['sale_qty'] = result[0] or 0
                 data['sale_value'] = result[1] or 0
 
-        # Get POS sales data with UoM conversion
+            # Add sales from phantom BoM (kit) products
+            for kit_product_id, bom_qty in phantom_bom_data.items():
+                self.env.cr.execute("""
+                                    SELECT COALESCE(SUM(sol.qty_delivered / sol_uom.factor * prod_uom.factor),
+                                                    0) as qty,
+                                           COALESCE(SUM(sol.qty_delivered * sol.price_unit), 0) as value
+                                    FROM sale_order_line sol
+                                        JOIN sale_order so
+                                    ON sol.order_id = so.id
+                                        JOIN product_product pp ON sol.product_id = pp.id
+                                        JOIN product_template pt ON pp.product_tmpl_id = pt.id
+                                        JOIN uom_uom prod_uom ON pt.uom_id = prod_uom.id
+                                        JOIN uom_uom sol_uom ON sol.product_uom_id = sol_uom.id
+                                    WHERE sol.product_id = %s
+                                      AND so.state IN ('sale'
+                                        , 'done')
+                                      AND so.date_order:: date >= %s
+                                      AND so.date_order:: date <= %s
+                                    """, (kit_product_id, date_start, date_end))
+
+                result = self.env.cr.fetchone()
+                if result and result[0]:
+                    data['sale_qty'] += (result[0] or 0) * bom_qty
+                    data['sale_value'] += (result[1] or 0) * bom_qty
+
+        # Get POS sales data (POS uses product's default UoM)
         if self.include_pos:
+            # Direct POS sales of the product
             self.env.cr.execute("""
                                 SELECT COALESCE(SUM(pol.qty), 0) as qty,
                                        COALESCE(SUM(pol.price_subtotal_incl), 0) as value
                                 FROM pos_order_line pol
-                                JOIN pos_order po ON pol.order_id = po.id
+                                    JOIN pos_order po
+                                ON pol.order_id = po.id
                                 WHERE pol.product_id = %s
-                                  AND po.state IN ('paid', 'done', 'invoiced')
-                                  AND po.date_order::date >= %s
-                                  AND po.date_order::date <= %s
+                                  AND po.state IN ('paid'
+                                    , 'done'
+                                    , 'invoiced')
+                                  AND po.date_order:: date >= %s
+                                  AND po.date_order:: date <= %s
                                 """, (product_id, date_start, date_end))
 
             result = self.env.cr.fetchone()
@@ -285,7 +318,76 @@ class StockMovementReportWizard(models.TransientModel):
                 data['pos_qty'] = result[0] or 0
                 data['pos_value'] = result[1] or 0
 
+            # Add POS sales from phantom BoM (kit) products
+            for kit_product_id, bom_qty in phantom_bom_data.items():
+                self.env.cr.execute("""
+                                    SELECT COALESCE(SUM(pol.qty), 0) as qty,
+                                           COALESCE(SUM(pol.price_subtotal_incl), 0) as value
+                                    FROM pos_order_line pol
+                                        JOIN pos_order po
+                                    ON pol.order_id = po.id
+                                    WHERE pol.product_id = %s
+                                      AND po.state IN ('paid'
+                                        , 'done'
+                                        , 'invoiced')
+                                      AND po.date_order:: date >= %s
+                                      AND po.date_order:: date <= %s
+                                    """, (kit_product_id, date_start, date_end))
+
+                result = self.env.cr.fetchone()
+                if result and result[0]:
+                    data['pos_qty'] += (result[0] or 0) * bom_qty
+                    data['pos_value'] += (result[1] or 0) * bom_qty
+
         return data
+
+    def _get_phantom_bom_components(self, product_id):
+        """
+        Find all phantom BoM products that contain this product as a component.
+        Returns a dict: {kit_product_id: quantity_of_component_in_kit}
+        """
+        result = {}
+
+        # Find BoM lines where this product is a component
+        bom_lines = self.env['mrp.bom.line'].search([
+            ('product_id', '=', product_id)
+        ])
+
+        for line in bom_lines:
+            bom = line.bom_id
+            # Only consider phantom (kit) BoMs
+            if bom.type == 'phantom':
+                # Get the kit product(s)
+                if bom.product_id:
+                    # BoM is for a specific variant
+                    kit_product_id = bom.product_id.id
+                else:
+                    # BoM is for template, get all variants
+                    kit_products = bom.product_tmpl_id.product_variant_ids
+                    for kit_product in kit_products:
+                        kit_product_id = kit_product.id
+                        # Calculate the quantity considering UoM
+                        component_qty = line.product_qty
+                        # Convert to product UoM if different
+                        if line.product_uom_id != line.product_id.uom_id:
+                            component_qty = line.product_uom_id._compute_quantity(
+                                line.product_qty,
+                                line.product_id.uom_id
+                            )
+                        result[kit_product_id] = component_qty
+                    continue
+
+                # Calculate the quantity considering UoM
+                component_qty = line.product_qty
+                # Convert to product UoM if different
+                if line.product_uom_id != line.product_id.uom_id:
+                    component_qty = line.product_uom_id._compute_quantity(
+                        line.product_qty,
+                        line.product_id.uom_id
+                    )
+                result[kit_product_id] = component_qty
+
+        return result
 
     def action_generate_report(self):
         """Generate the Excel report"""
